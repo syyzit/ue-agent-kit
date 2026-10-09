@@ -14,6 +14,10 @@ Engine  = /Users/Shared/Epic Games/UE_<EngineAssociation>, or $UE_ENGINE.
   ue headless script.py        run Python with no editor UI (UnrealEditor-Cmd); prints LogPython output
   ue shot [out.png]            screenshot the whole editor as the user sees it (includes PIE + HUD)
   ue shot --game [out.png] [--size WxH]  PIE game view only, rendered at WxH (default 1600x900; no UI/HUD)
+  ue record [dir] [--seconds S | --frames N] [--fps 60] [--slowmo K] [--every M] [--keep-frames]
+                               dump PIE frames at a fixed game-time rate, then build dir/sheet.png (labelled
+                               contact sheet, every Mth frame) and dir/clip.mp4 (K x slower; needs ffmpeg).
+                               Raw frames (~1.7 MB each) are deleted unless --keep-frames or no ffmpeg.
   ue windows | ue close <title>  list / close top-level editor windows (popups that cover shots)
   ue capture [out.png] [--annotate]  render the level viewport from the editor camera;
                                --annotate overlays a metre grid + actor labels for spatial work
@@ -389,6 +393,78 @@ def game_shot(uproject, out, size):
     raise SystemExit("HighResShot produced no file within 10s; see `ue log -g Screenshot`")
 
 
+def record(uproject, out, frames, fps, slowmo, every, keep_frames):
+    shots = os.path.join(os.path.dirname(uproject), "Saved", "Screenshots")
+    pattern = os.path.join(shots, "**", "MovieFrame*.png")
+    before = set(glob.glob(pattern, recursive=True))
+    msg = json.loads(toolset_call(uproject, PY_TOOLSET, "record_frames", {"frames": frames, "fps": fps}))["returnValue"]
+    if not msg.startswith("recording"):
+        raise SystemExit(msg)
+    print(msg)
+    deadline, last = time.time() + 60 + frames * 2, -1
+    while time.time() < deadline:
+        new = sorted(set(glob.glob(pattern, recursive=True)) - before)
+        if len(new) >= frames:
+            break
+        if len(new) != last:
+            last, deadline = len(new), max(deadline, time.time() + 30)
+        time.sleep(0.5)
+    else:
+        raise SystemExit(f"only {last} of {frames} frames arrived; is PIE still running?")
+    time.sleep(0.5)  # last file finishing
+    out = out or os.path.join(IMAGE_DIR, time.strftime("rec-%H%M%S"))
+    os.makedirs(out, exist_ok=True)
+    for i, src in enumerate(new[:frames]):
+        shutil.move(src, os.path.join(out, f"frame_{i:04d}.png"))
+    for extra in new[frames:]:
+        os.remove(extra)
+    print(f"{frames} frames ({frames / fps:.2f}s game time) -> {out}")
+    sheet = contact_sheet(out, fps, every)
+    if sheet:
+        print(f"sheet: {sheet}")
+    if shutil.which("ffmpeg"):
+        clip = os.path.join(out, "clip.mp4")
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-framerate", str(fps / slowmo),
+                        "-i", os.path.join(out, "frame_%04d.png"), "-pix_fmt", "yuv420p",
+                        "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2", clip], check=True)
+        print(f"clip:  {clip} ({slowmo:g}x slower than game time)")
+        if not keep_frames:
+            for f in glob.glob(os.path.join(out, "frame_*.png")):
+                os.remove(f)
+            print("raw frames deleted (pass --keep-frames to keep them; or extract one with "
+                  "`ffmpeg -i clip.mp4 -vf select=eq(n\\,N) -frames:v 1 f.png`)")
+
+
+def contact_sheet(folder, fps, every, columns=4, width=480):
+    """Grid of every Mth frame labelled with frame index and game time. Needs Pillow; skipped without it."""
+    try:
+        from PIL import Image, ImageDraw
+    except ImportError:
+        print("no Pillow: skipping contact sheet (pip install pillow)")
+        return None
+    files = sorted(glob.glob(os.path.join(folder, "frame_*.png")))[::every][:48]
+    if not files:
+        return None
+    thumbs = []
+    for f in files:
+        im = Image.open(f).convert("RGB")
+        im = im.resize((width, int(im.height * width / im.width)))
+        i = int(os.path.basename(f)[6:10])
+        d = ImageDraw.Draw(im)
+        label = f"#{i}  t={i / fps:.3f}s"
+        d.rectangle((0, 0, 8 + 7 * len(label), 16), fill=(0, 0, 0))
+        d.text((4, 2), label, fill=(255, 255, 0))
+        thumbs.append(im)
+    rows = (len(thumbs) + columns - 1) // columns
+    h = thumbs[0].height
+    sheet = Image.new("RGB", (columns * width, rows * h), (20, 20, 20))
+    for k, im in enumerate(thumbs):
+        sheet.paste(im, ((k % columns) * width, (k // columns) * h))
+    path = os.path.join(folder, "sheet.png")
+    sheet.save(path)
+    return path
+
+
 def windows(uproject):
     text = toolset_call(uproject, "SlateInspectorToolset.SlateInspectorToolset", "Windows", {"action": "list"})
     return json.loads(json.loads(text)["returnValue"])
@@ -536,6 +612,14 @@ def main(argv):
             print(game_shot(up, os.path.abspath(out) if out else None, size))
         else:
             print(toolset_call(up, "EditorToolset.EditorAppToolset", "CaptureEditorImage", {}, out))
+    elif cmd == "record":
+        opt = lambda name, default: float(rest[rest.index(name) + 1]) if name in rest else default
+        fps = opt("--fps", 60.0)
+        frames = int(opt("--frames", 0)) or int(round(opt("--seconds", 2.0) * fps))
+        flags = {"--fps", "--frames", "--seconds", "--slowmo", "--every"}  # flags that take a value
+        out = next((a for i, a in enumerate(rest) if not a.startswith("--") and (i == 0 or rest[i - 1] not in flags)), None)
+        record(up, os.path.abspath(out) if out else None, frames, fps, opt("--slowmo", 1.0),
+               int(opt("--every", max(1, frames // 24))), "--keep-frames" in rest)
     elif cmd == "windows":
         for w in windows(up):
             print(w["index"], w["title"])

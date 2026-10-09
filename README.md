@@ -51,7 +51,19 @@ Run `ue --help` for every command. The ones you will use most:
 ue py 'result = unreal.SystemLibrary.get_engine_version()'      # editor Python
 ue call editor_toolset.toolsets.blueprint.BlueprintTools.write_graph_dsl graph=/Game/BP_X.BP_X:EventGraph code=@graph.dsl
 ue play && ue input /Game/Input/IA_Move 1 --for 2 --wait && ue shot --game run.png
+ue record run/ --seconds 2 --slowmo 4   # labelled contact sheet + 0.25x mp4 of the next 2 s of PIE
 ```
+
+### Watching motion: `ue record`
+
+Agents judge motion badly from single screenshots, and real-time capture drops frames whenever
+rendering is slow. `ue record` turns on the engine's fixed frame rate, so every frame advances exactly
+1/fps of game time; the game slows down while frames are written instead of skipping them. It then
+dumps the next N frames (`r.DumpingMovie`) and builds two outputs:
+- `sheet.png`, a labelled grid of evenly spaced frames, for the agent to read
+- `clip.mp4`, optionally slowed down, for a human to watch
+
+The frame-rate settings restore themselves in the editor when the dump ends.
 
 `ue setup` makes these changes:
 1. It enables `ModelContextProtocol`, `AllToolsets`, `PythonScriptPlugin`, `EditorScriptingUtilities`
@@ -99,6 +111,7 @@ with 0 deaths. Problems found along the way, and how each was resolved:
 | `UnrealEditor-Cmd` hid `print` output and hung when read through a pipe (UnrealTraceServer inherits stdout) | `ue headless` |
 | Passing JSON args in shell was error-prone | `ue call key=value key:=json key=@file` |
 | Creating a project meant hand-renaming template modules | `ue new` |
+| No way to see motion: screenshots miss it, and real-time capture drops frames | `ue record` (fixed timestep frame dump, contact sheet, slow-mo mp4) |
 
 These are engine and toolset quirks with no kit-side fix. The skill documents them:
 - "optional" struct params must be explicit `null`

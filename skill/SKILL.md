@@ -33,11 +33,16 @@ ue play / ue stop-play
 ue input /Game/Input/IA_Move 1 --for 1.5 [--wait]   # hold an Enhanced Input action in PIE (real mapping path)
 ue shot --game out.png [--size 1600x900]        # PIE game view, no HUD
 ue shot out.png                                 # whole editor incl. PIE + HUD
+ue record dir --seconds 2 [--fps 60] [--slowmo 4]   # fixed-timestep frame dump -> dir/sheet.png + dir/clip.mp4
 ue windows | ue close 'Message Log'             # popups that cover screenshots
 ue stop | ue restart | ue build
 ```
-Read the PNGs. Judge visual work from images, never from numbers alone. For gameplay, record a
-position trace from an editor-side bot (`unreal.register_slate_post_tick_callback`) and check it.
+Read the PNGs. Judge visual work from images, never from numbers alone. For anything that moves
+(animation, physics, hit reactions, camera), use `ue record` and Read `sheet.png`: frames are
+evenly spaced in game time and labelled, and the game slows down instead of dropping frames.
+Start the action first (bot, `ue input`, ability), then record. Hand the user `clip.mp4`
+(`--slowmo 4` for 0.25x). For gameplay logic, also record a position trace from an editor-side bot
+(`unreal.register_slate_post_tick_callback`) and check it.
 
 ## Tool choice
 - Python (`ue py`) for anything the `unreal` module exposes; it's the most general path.

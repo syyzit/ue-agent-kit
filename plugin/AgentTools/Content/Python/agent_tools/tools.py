@@ -8,6 +8,7 @@ dev machines only.
 
 import contextlib
 import io
+import json
 import traceback
 
 import unreal
@@ -27,6 +28,24 @@ def _player_input_subsystem():
     subs = [s for s in unreal.ObjectIterator(unreal.EnhancedInputLocalPlayerSubsystem)
             if not s.get_path_name().startswith(("/Script", "Default__"))]
     return subs[-1] if subs else None
+
+
+# Active frame dump: engine frame count at which to restore the previous frame-rate settings.
+_RECORD: dict = {}
+
+
+def _engine():
+    return unreal.find_object(None, "/Engine/Transient.UnrealEdEngine_0") or unreal.find_object(None, "/Engine/Transient.GameEngine_0")
+
+
+def _record_tick(delta_seconds: float) -> None:
+    if unreal.SystemLibrary.get_frame_count() < _RECORD["until"] and _game_world():
+        return
+    # Python reads of r.DumpingMovie are stale, so completion is judged by engine frame count.
+    unreal.SystemLibrary.execute_console_command(None, "r.DumpingMovie 0")
+    unreal.ToolsetLibrary.set_object_properties(_engine(), _RECORD["restore"])
+    unreal.unregister_slate_post_tick_callback(_RECORD.pop("handle"))
+    _RECORD.clear()
 
 
 def _game_world():
@@ -133,3 +152,31 @@ class AgentTools(unreal.ToolsetDefinition):
         if _TICK_HANDLE is None:
             _TICK_HANDLE = unreal.register_slate_post_tick_callback(_tick)
         return f"holding {action} = ({x}, {y}, {z}) for {seconds}s"
+
+    @toolset_registry.tool_call
+    @staticmethod
+    def record_frames(frames: int, fps: float) -> str:
+        """Dumps the next `frames` PIE frames to Saved/Screenshots/<Platform>Editor/MovieFrameNNNNN.png.
+
+        Turns on the engine's fixed frame rate so every frame advances exactly 1/fps of game time,
+        however slow rendering and saving are (the game runs slower than real time while recording).
+        The previous frame-rate settings are restored automatically when the dump ends.
+
+        Args:
+            frames: Number of frames to write.
+            fps: Game-time frame rate of the recording.
+
+        Returns:
+            What was started, or why not.
+        """
+        if not _game_world():
+            return "PIE is not running"
+        if _RECORD:
+            return "a recording is already running"
+        eng = _engine()
+        _RECORD["restore"] = unreal.ToolsetLibrary.get_object_properties(eng, ["bUseFixedFrameRate", "fixedFrameRate"])
+        unreal.ToolsetLibrary.set_object_properties(eng, json.dumps({"bUseFixedFrameRate": True, "fixedFrameRate": fps}))
+        unreal.SystemLibrary.execute_console_command(_game_world(), f"r.DumpingMovie {frames}")
+        _RECORD["until"] = unreal.SystemLibrary.get_frame_count() + frames + 3
+        _RECORD["handle"] = unreal.register_slate_post_tick_callback(_record_tick)
+        return f"recording {frames} frames at {fps} fps ({frames / fps:.2f}s of game time)"
