@@ -1,0 +1,410 @@
+#!/usr/bin/env python3
+"""Drive an Unreal Editor from the shell over Epic's official Unreal MCP plugin.
+
+Project = nearest *.uproject above the cwd, or $UE_PROJECT.
+Engine  = /Users/Shared/Epic Games/UE_<EngineAssociation>, or $UE_ENGINE.
+
+  ue setup [--port N]          enable Unreal MCP + toolsets + AgentTools in this project, write .mcp.json
+  ue start | stop | restart    editor lifecycle (start waits for MCP; stop waits for the port to free)
+  ue status                    editor process / MCP state
+  ue build                     compile the <Project>Editor target (editor must be stopped)
+  ue log [-n N] [-g REGEX]     tail the editor log (default 40 lines)
+  ue headless script.py        run Python with no editor UI (UnrealEditor-Cmd); prints LogPython output
+  ue shot [out.png]            screenshot the whole editor as the user sees it (use this for PIE)
+  ue capture [out.png] [--annotate]  render the level viewport from the editor camera;
+                               --annotate overlays a metre grid + actor labels for spatial work
+
+  ue list                      list toolsets
+  ue describe <toolset>        describe a toolset's tools
+  ue call <toolset.tool> [json] call any toolset tool (images in results are saved as PNGs)
+  ue tools                     raw MCP tools/list
+  ue py '<code>' | ue py -f f.py   run Python in the editor (AgentTools.exec_python; `result = x` returns x)
+  ue cmd '<console command>'   run a console command (PIE world when playing)
+  ue play | ue stop-play       start / end Play-In-Editor
+"""
+
+import base64
+import glob
+import json
+import os
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+
+KIT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+DEFAULT_PORT = 18765
+PY_TOOLSET = "agent_tools.tools.AgentTools"
+SETTINGS_SECTION = "/Script/ModelContextProtocolEngine.ModelContextProtocolSettings"
+# AllToolsets pulls in GameFeatures, which logs a load error without this Asset Manager rule.
+GAME_FEATURE_RULE = ('+PrimaryAssetTypesToScan=(PrimaryAssetType="GameFeatureData",'
+                     'AssetBaseClass="/Script/GameFeatures.GameFeatureData",bHasBlueprintClasses=False,'
+                     'bIsEditorOnly=False,Directories=((Path="/Game/Unused")),SpecificAssets=,'
+                     'Rules=(Priority=-1,ChunkId=-1,bApplyRecursively=True,CookRule=AlwaysCook))')
+PLUGINS = ["ModelContextProtocol", "AllToolsets", "PythonScriptPlugin", "EditorScriptingUtilities", "AgentTools"]
+IMAGE_DIR = os.environ.get("UE_IMAGE_DIR", "/tmp/ue-captures")
+
+
+# ---------------------------------------------------------------- project / engine
+
+def find_project():
+    if os.environ.get("UE_PROJECT"):
+        return os.path.abspath(os.environ["UE_PROJECT"])
+    d = os.getcwd()
+    while d != "/":
+        hits = glob.glob(os.path.join(d, "*.uproject"))
+        if hits:
+            return hits[0]
+        d = os.path.dirname(d)
+    raise SystemExit("no *.uproject above the cwd (set UE_PROJECT)")
+
+
+def project_name(uproject):
+    return os.path.splitext(os.path.basename(uproject))[0]
+
+
+def engine_dir(uproject):
+    if os.environ.get("UE_ENGINE"):
+        return os.environ["UE_ENGINE"]
+    assoc = json.load(open(uproject)).get("EngineAssociation") or ""
+    if assoc:
+        d = f"/Users/Shared/Epic Games/UE_{assoc}"
+        if os.path.isdir(d):
+            return d
+    installs = sorted(glob.glob("/Users/Shared/Epic Games/UE_5.*"))
+    if not installs:
+        raise SystemExit("no engine found (set UE_ENGINE)")
+    return installs[-1]
+
+
+def settings_ini(uproject):
+    return os.path.join(os.path.dirname(uproject), "Config", "DefaultEditorPerProjectUserSettings.ini")
+
+
+def port(uproject):
+    if os.environ.get("UE_MCP_PORT"):
+        return int(os.environ["UE_MCP_PORT"])
+    try:
+        m = re.search(r"^ServerPortNumber=(\d+)", open(settings_ini(uproject)).read(), re.M)
+        if m:
+            return int(m.group(1))
+    except FileNotFoundError:
+        pass
+    return 8000  # plugin default
+
+
+def url(uproject):
+    return f"http://127.0.0.1:{port(uproject)}/mcp"
+
+
+def log_path(uproject):
+    name = project_name(uproject)
+    return os.path.expanduser(f"~/Library/Logs/Unreal Engine/{name}Editor/{name}.log")
+
+
+# ---------------------------------------------------------------- MCP client
+
+def _post(endpoint, payload, session=None, timeout=600):
+    headers = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
+    if session:
+        headers["Mcp-Session-Id"] = session
+    req = urllib.request.Request(endpoint, json.dumps(payload).encode(), headers)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        sid = resp.headers.get("Mcp-Session-Id") or session
+        body = resp.read().decode()
+    if not body.strip():
+        return None, sid
+    if body.lstrip().startswith("{"):
+        return json.loads(body), sid
+    msg = None  # SSE: keep the last data: line carrying a JSON-RPC message
+    for line in body.splitlines():
+        if line.startswith("data:"):
+            msg = json.loads(line[5:].strip())
+    return msg, sid
+
+
+def rpc(uproject, method, params):
+    endpoint = url(uproject)
+    try:
+        init = {"jsonrpc": "2.0", "id": 0, "method": "initialize",
+                "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                           "clientInfo": {"name": "ue-cli", "version": "1"}}}
+        _, sid = _post(endpoint, init, timeout=10)
+        _post(endpoint, {"jsonrpc": "2.0", "method": "notifications/initialized"}, sid, timeout=10)
+        msg, _ = _post(endpoint, {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}, sid)
+    except (urllib.error.URLError, ConnectionError) as e:
+        raise SystemExit(f"MCP not reachable at {endpoint} ({e}); is the editor running? `ue start`")
+    if msg is None:
+        raise SystemExit("empty response")
+    if "error" in msg:
+        raise SystemExit(json.dumps(msg["error"], indent=2))
+    return msg["result"]
+
+
+def call_tool(uproject, name, arguments):
+    result = rpc(uproject, "tools/call", {"name": name, "arguments": arguments})
+    out = "\n".join(c.get("text", "") for c in result.get("content", []) if c.get("type") == "text")
+    if result.get("isError"):
+        raise SystemExit(out)
+    return out
+
+
+def save_images(text, out=None):
+    """Replace base64 images inside a JSON tool result with paths of saved PNG files."""
+    try:
+        value = json.loads(text)
+    except ValueError:
+        return text
+    saved = []
+
+    def walk(o):
+        if isinstance(o, dict):
+            if str(o.get("mimeType", "")).startswith("image/") and isinstance(o.get("data"), str):
+                ext = o["mimeType"].split("/")[1]
+                path = out if out and not saved else os.path.join(
+                    IMAGE_DIR, f"{time.strftime('%H%M%S')}-{len(saved)}.{ext}")
+                os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+                open(path, "wb").write(base64.b64decode(o["data"]))
+                saved.append(path)
+                return {"mimeType": o["mimeType"], "file": path}
+            return {k: walk(v) for k, v in o.items()}
+        if isinstance(o, list):
+            return [walk(v) for v in o]
+        return o
+
+    value = walk(value)
+    return json.dumps(value, indent=1) if saved else text
+
+
+def toolset_call(uproject, toolset, tool, arguments, out=None):
+    text = call_tool(uproject, "call_tool", {"toolset_name": toolset, "tool_name": tool, "arguments": arguments})
+    return save_images(text, out)
+
+
+def py(uproject, code):
+    out = toolset_call(uproject, PY_TOOLSET, "exec_python", {"code": code})
+    try:  # results come back JSON-wrapped; unwrap to plain text
+        v = json.loads(out)
+        if isinstance(v, dict) and len(v) == 1:
+            v = next(iter(v.values()))
+        return v if isinstance(v, str) else out
+    except ValueError:
+        return out
+
+
+# ---------------------------------------------------------------- editor lifecycle
+
+def running(uproject):
+    return subprocess.run(["pgrep", "-f", f"UnrealEditor.*{re.escape(os.path.basename(uproject))}"],
+                          capture_output=True).returncode == 0
+
+
+def port_busy(p):
+    with socket.socket() as s:
+        s.settimeout(0.5)
+        return s.connect_ex(("127.0.0.1", p)) == 0
+
+
+def mcp_up(uproject):
+    try:
+        _post(url(uproject), {"jsonrpc": "2.0", "id": 0, "method": "initialize",
+                               "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                                          "clientInfo": {"name": "probe", "version": "0"}}}, timeout=2)
+        return True
+    except Exception:
+        return False
+
+
+def start(uproject):
+    if running(uproject):
+        print("already running")
+        return
+    p = port(uproject)
+    if port_busy(p):
+        raise SystemExit(f"port {p} busy (another editor or server); refusing to start")
+    app = os.path.join(engine_dir(uproject), "Engine/Binaries/Mac/UnrealEditor.app")
+    subprocess.run(["open", "-n", "-a", app, "--args", uproject,
+                    "-ModelContextProtocolStartServer", f"-ModelContextProtocolPort={p}"], check=True)
+    t0 = time.time()
+    while time.time() - t0 < 900:
+        if mcp_up(uproject):
+            print(f"mcp up on :{p} after {int(time.time() - t0)}s")
+            return
+        if time.time() - t0 > 60 and not running(uproject):
+            raise SystemExit(f"editor exited during startup; see `ue log`")
+        time.sleep(1)
+    raise SystemExit("editor started but MCP never came up; see `ue log -g ModelContextProtocol`")
+
+
+def stop(uproject):
+    if running(uproject):
+        try:
+            py(uproject, "unreal.SystemLibrary.quit_editor()")
+        except SystemExit:
+            subprocess.run(["pkill", "-INT", "-f", f"UnrealEditor.*{re.escape(os.path.basename(uproject))}"])
+    for _ in range(120):
+        if not running(uproject) and not port_busy(port(uproject)):
+            print("stopped")
+            return
+        time.sleep(1)
+    raise SystemExit("editor did not stop within 120s")
+
+
+def headless(uproject, script):
+    cmd = os.path.join(engine_dir(uproject), "Engine/Binaries/Mac/UnrealEditor-Cmd")
+    # Output goes to a file, not a pipe: UnrealTraceServer daemonizes with our stdout and would
+    # hold a pipe open forever.
+    with tempfile.TemporaryFile("w+") as f:
+        subprocess.run([cmd, uproject, "-run=pythonscript", f"-script={os.path.abspath(script)}",
+                        "-unattended", "-nullrhi", "-nosplash", "-stdout", "-AllowStdOutLogVerbosity"],
+                       stdout=f, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
+        f.seek(0)
+        output = f.read()
+    ok = False
+    for line in output.splitlines():
+        m = re.search(r"\]LogPython: (.*)", line)
+        if m and "start-up script" not in m.group(1) and "pip-enabled" not in m.group(1):
+            print(m.group(1))
+        ok = ok or "Python script executed successfully" in line
+    if not ok:
+        print("\n".join(l for l in output.splitlines() if "Error" in l)[-4000:], file=sys.stderr)
+    sys.exit(0 if ok else 1)
+
+
+def build(uproject):
+    if running(uproject):
+        raise SystemExit("stop the editor first (or use Live Coding from inside it)")
+    script = os.path.join(engine_dir(uproject), "Engine/Build/BatchFiles/Mac/Build.sh")
+    proc = subprocess.run([script, f"{project_name(uproject)}Editor", "Mac", "Development",
+                           f"-Project={uproject}", "-WaitMutex"], capture_output=True, text=True)
+    for line in (proc.stdout + proc.stderr).splitlines():
+        if re.search(r"error|warning:|Result:", line):
+            print(line)
+    sys.exit(proc.returncode)
+
+
+def capture(uproject, out, annotate):
+    # The plugin rejects omitted "optional" struct params; explicit nulls work.
+    notes = {"gridSpacing": 100, "gridExtent": 5000, "gridHeight": 0, "maxLabelDistance": 10000,
+             "classFilter": None, "maxLabels": 20} if annotate else None
+    return toolset_call(uproject, "EditorToolset.EditorAppToolset", "CaptureViewport",
+                        {"captureTransform": None, "annotations": notes}, out)
+
+
+# ---------------------------------------------------------------- setup
+
+def setup(uproject, new_port):
+    root = os.path.dirname(uproject)
+    d = json.load(open(uproject))
+    plugins = d.setdefault("Plugins", [])
+    for name in PLUGINS:
+        entry = next((p for p in plugins if p["Name"] == name), None)
+        if entry:
+            entry["Enabled"] = True
+        else:
+            plugins.append({"Name": name, "Enabled": True})
+    with open(uproject, "w") as f:
+        f.write(json.dumps(d, indent="\t") + "\n")
+
+    dst = os.path.join(root, "Plugins", "AgentTools")
+    shutil.rmtree(dst, ignore_errors=True)
+    shutil.copytree(os.path.join(KIT, "plugin", "AgentTools"), dst)
+
+    ini = settings_ini(uproject)
+    os.makedirs(os.path.dirname(ini), exist_ok=True)
+    text = open(ini).read() if os.path.exists(ini) else ""
+    p = new_port or (port(uproject) if f"[{SETTINGS_SECTION}]" in text else DEFAULT_PORT)
+    block = f"[{SETTINGS_SECTION}]\nbAutoStartServer=True\nServerPortNumber={p}\nbEnableToolSearch=True\n"
+    pattern = re.compile(r"^\[" + re.escape(SETTINGS_SECTION) + r"\]\n(?:(?!\[).*\n?)*", re.M)
+    text = pattern.sub(block, text) if pattern.search(text) else (text.rstrip() + "\n\n" + block).lstrip()
+    open(ini, "w").write(text)
+
+    game_ini = os.path.join(root, "Config", "DefaultGame.ini")
+    game = open(game_ini).read() if os.path.exists(game_ini) else ""
+    if 'PrimaryAssetType="GameFeatureData"' not in game:
+        section = "[/Script/Engine.AssetManagerSettings]"
+        if section in game:
+            game = game.replace(section, section + "\n" + GAME_FEATURE_RULE, 1)
+        else:
+            game = game.rstrip() + f"\n\n{section}\n{GAME_FEATURE_RULE}\n"
+        open(game_ini, "w").write(game.lstrip())
+
+    mcp_json = os.path.join(root, ".mcp.json")
+    cfg = json.load(open(mcp_json)) if os.path.exists(mcp_json) else {}
+    cfg.setdefault("mcpServers", {}).pop("unreal", None)
+    cfg["mcpServers"]["unreal-mcp"] = {"type": "http", "url": f"http://127.0.0.1:{p}/mcp"}
+    open(mcp_json, "w").write(json.dumps(cfg, indent=2) + "\n")
+
+    print(f"{project_name(uproject)}: plugins {', '.join(PLUGINS)} enabled; AgentTools copied; "
+          f"MCP on :{p}; .mcp.json written.")
+    if os.path.isdir(os.path.join(root, "Source")):
+        print("C++ project: run `ue build` before `ue start`.")
+
+
+# ---------------------------------------------------------------- main
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return
+    cmd, rest = argv[0], argv[1:]
+    up = find_project()
+    if cmd == "setup":
+        setup(up, int(rest[rest.index("--port") + 1]) if "--port" in rest else None)
+    elif cmd == "start":
+        start(up)
+    elif cmd == "stop":
+        stop(up)
+    elif cmd == "restart":
+        stop(up)
+        start(up)
+    elif cmd == "status":
+        print(f"project  {up}\nengine   {engine_dir(up)}\nmcp      {url(up)}")
+        print("editor   " + ("running" if running(up) else "stopped"))
+        print("mcp      " + ("up" if mcp_up(up) else "down"))
+    elif cmd == "build":
+        build(up)
+    elif cmd == "log":
+        n = int(rest[rest.index("-n") + 1]) if "-n" in rest else 40
+        lines = open(log_path(up), errors="replace").read().splitlines()
+        if "-g" in rest:
+            rx = re.compile(rest[rest.index("-g") + 1], re.I)
+            lines = [l for l in lines if rx.search(l)]
+        print("\n".join(lines[-n:]))
+    elif cmd == "headless":
+        headless(up, rest[0])
+    elif cmd == "shot":
+        out = next((a for a in rest if not a.startswith("-")), None)
+        print(toolset_call(up, "EditorToolset.EditorAppToolset", "CaptureEditorImage", {}, out))
+    elif cmd == "capture":
+        out = next((a for a in rest if not a.startswith("-")), None)
+        print(capture(up, out, "--annotate" in rest))
+    elif cmd == "tools":
+        print(json.dumps(rpc(up, "tools/list", {}), indent=2))
+    elif cmd == "list":
+        print(call_tool(up, "list_toolsets", {}))
+    elif cmd == "describe":
+        print(call_tool(up, "describe_toolset", {"toolset_name": rest[0]}))
+    elif cmd == "call":
+        toolset, tool = rest[0].rsplit(".", 1)
+        print(toolset_call(up, toolset, tool, json.loads(rest[1]) if len(rest) > 1 else {}))
+    elif cmd == "py":
+        code = open(rest[1]).read() if rest[0] == "-f" else rest[0]
+        print(py(up, code))
+    elif cmd == "cmd":
+        print(toolset_call(up, PY_TOOLSET, "console", {"command": " ".join(rest)}))
+    elif cmd == "play":
+        print(py(up, "unreal.get_editor_subsystem(unreal.LevelEditorSubsystem).editor_request_begin_play()"))
+    elif cmd == "stop-play":
+        print(py(up, "unreal.get_editor_subsystem(unreal.LevelEditorSubsystem).editor_request_end_play()"))
+    else:
+        raise SystemExit(__doc__)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
