@@ -1,7 +1,9 @@
 # ue-agent-kit
 
 Lets a coding agent (Claude Code) drive Unreal Editor 5.8 on macOS from the shell, on top of
-Epic's official **Unreal MCP** plugin (`ModelContextProtocol`, experimental, ships with UE 5.7+).
+Epic's official **Unreal MCP** plugin (`ModelContextProtocol`, experimental, ships with UE 5.8).
+Tested on UE 5.8.3, macOS 27, Apple Silicon. Most of it is platform-neutral, but the editor
+lifecycle commands assume macOS paths.
 
 - `bin/ue`: single-file CLI. Editor lifecycle (start/stop/build/log), a streamable-HTTP MCP client,
   viewport/editor screenshots saved as PNGs, and `ue setup` to configure any project.
@@ -10,14 +12,19 @@ Epic's official **Unreal MCP** plugin (`ModelContextProtocol`, experimental, shi
   `ProgrammaticToolset` sandboxes imports, which blocks most real work.
 - `skill/SKILL.md`: Claude Code skill (symlinked to `~/.claude/skills/unreal`).
 
-## Install (done on this machine)
+## Install
+
+Requirements: UE 5.8 from the Epic Games Launcher, Xcode (for C++ projects), Python 3.9+.
 
 ```bash
-ln -sf ~/projects/ue-agent-kit/bin/ue ~/.local/bin/ue
-ln -sfn ~/projects/ue-agent-kit/skill ~/.claude/skills/unreal
+git clone https://github.com/syyzit/ue-agent-kit ~/ue-agent-kit
+ln -sf ~/ue-agent-kit/bin/ue ~/.local/bin/ue            # any dir on PATH
+ln -sfn ~/ue-agent-kit/skill ~/.claude/skills/unreal     # Claude Code skill
 claude plugin install unreal-engine-skills-for-claude-code@claude-plugins-official   # Epic's skills + hook
-# ~/.claude/settings.json: "enabledMcpjsonServers": ["unreal-mcp"]  (auto-approves the project .mcp.json entry)
 ```
+
+Optionally add `"enabledMcpjsonServers": ["unreal-mcp"]` to `~/.claude/settings.json` so Claude Code
+connects to the editor in set-up projects without asking first.
 
 Epic's plugin adds the skills `unreal-mcp` (discovery, dispatch and safety), `create-toolset` and
 `unreal-skill`, plus a SessionStart hook that detects UE projects. Its advice to use Live Coding does
@@ -64,8 +71,8 @@ automation tests, semantic asset search, output log, PIE control, viewport camer
 
 ## Outside the editor
 
-Epic Games Launcher, the Fab web panel and OS dialogs have no API. Use
-`~/projects/mac-gui-driver/gui.sh` for those.
+Epic Games Launcher, the Fab web panel and OS dialogs have no API. They need a desktop
+automation tool that can screenshot windows and click (Accessibility + Screen Recording permissions).
 
 ## Third-party landscape (checked 2026-10-09)
 
@@ -85,3 +92,13 @@ following are installed:
 - **Plain CLI routes still worth knowing:** `Build.sh` / `RunUAT.sh BuildCookRun`,
   `UnrealEditor-Cmd -ExecCmds="Automation RunTests X;Quit"`, Unreal Insights (`-trace=default`), and the
   Remote Control API (:30010) and Python remote execution (:6766), both of which MCP has superseded.
+
+## Security
+
+The MCP server listens on loopback only and has no authentication. `AgentTools.exec_python` runs
+arbitrary Python in the editor, so treat any local process as able to control your project.
+Use this on dev machines only, and save or commit before long agent sessions.
+
+## License
+
+MIT

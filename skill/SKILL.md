@@ -5,7 +5,7 @@ description: Operate Unreal Editor (UE 5.8, macOS) from the shell with the `ue` 
 
 # Driving Unreal Editor
 
-Kit: `~/projects/ue-agent-kit` (README has details). `ue` is on PATH; it finds the project from the
+Kit: ue-agent-kit (the README next to this skill's real path has details). `ue` is on PATH; it finds the project from the
 nearest `*.uproject` above the cwd (or `$UE_PROJECT`). Engine: `/Users/Shared/Epic Games/UE_5.8`.
 
 ## New or unconfigured project
@@ -44,7 +44,7 @@ Then Read the PNG to look at it. Judge visual work from images, never from numbe
   call `get_graph_dsl_docs` first), materials, Niagara, PCG, Sequencer/Control Rig, UMG, StateTree,
   GAS inspection, automation tests, config, plugins.
 - Editor UI with no API: `SlateInspectorToolset` (Snapshot → Click/Type by ref, Screenshot) — Playwright-style.
-- Outside the editor (Epic Launcher, Fab web panel, OS dialogs): `~/projects/mac-gui-driver/gui.sh`.
+- Outside the editor (Epic Launcher, Fab web panel, OS dialogs): a desktop GUI driver, if one is available.
 - C++: edit source, then `ue stop && ue build && ue start`. Live Coding is Windows-only. Ignore Epic's
   skill advice to use `LiveCodingToolset.CompileLiveCoding`: on Mac it returns "not available".
 - Headless or CI work with no editor running: `UnrealEditor-Cmd X.uproject -run=pythonscript -script=/abs.py -unattended -nullrhi`,
